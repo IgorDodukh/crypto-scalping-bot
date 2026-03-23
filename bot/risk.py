@@ -104,31 +104,44 @@ class RiskManager:
         leverage: int = Config.LEVERAGE,
     ) -> float:
         """
-        Kelly-inspired fixed fractional sizing:
-        Risk amount = balance × MAX_RISK_PER_TRADE
-        Contracts = risk_amount / (|entry - stop_loss| × leverage)
+        Fixed fractional sizing based on REAL account balance:
+          risk_amount  = balance × MAX_RISK_PER_TRADE
+          margin_used  = risk_amount  (this is how much USDT we put up)
+          notional     = margin_used × leverage
+          quantity     = notional / entry_price
 
-        Returns quantity in base currency (e.g. BTC, ETH).
-        Rounds down to avoid over-sizing.
+        Stop-loss is used as a sanity check — if SL is wider than 5% of
+        entry we reject the trade (prevents oversizing on bad ATR spikes).
+
+        Returns quantity in base currency (e.g. BTC, ETH, SOL).
         """
-        risk_amount = balance * Config.MAX_RISK_PER_TRADE
-        price_risk  = abs(entry_price - stop_loss)
+        risk_amount = balance * Config.MAX_RISK_PER_TRADE   # e.g. $100 × 2% = $2
+        notional    = risk_amount * leverage                 # e.g. $2 × 10 = $20 notional
+        quantity    = notional / entry_price                 # e.g. $20 / $90 = 0.222 SOL
 
-        if price_risk == 0:
-            log.warning("price_risk is 0, skipping position sizing")
+        price_risk_pct = abs(entry_price - stop_loss) / entry_price
+        if price_risk_pct == 0:
+            log.warning("SL equals entry price, skipping")
+            return 0.0
+        if price_risk_pct > 0.05:   # SL more than 5% away → reject
+            log.warning(f"SL too wide: {price_risk_pct:.2%} from entry, skipping")
             return 0.0
 
-        # notional position = risk_amount / price_risk  (in base units)
-        # but with leverage, our actual margin usage is:
-        # margin_used = (quantity × entry_price) / leverage
-        # We want: quantity × price_risk = risk_amount  (per contract, unlevered)
-        quantity = risk_amount / price_risk
+        # Hard notional cap: never risk more than $50 notional per trade regardless of balance
+        MAX_NOTIONAL = 50.0
+        if notional > MAX_NOTIONAL:
+            quantity = MAX_NOTIONAL / entry_price
+            log.info(f"Notional capped at ${MAX_NOTIONAL} → qty={quantity:.6f}")
 
-        # Minimum quantity guard
-        if quantity * entry_price < 5:   # $5 notional minimum
+        # Minimum notional guard
+        if quantity * entry_price < 5:
             log.warning(f"Position too small: ${quantity * entry_price:.2f} notional")
             return 0.0
 
+        log.info(
+            f"Position size: qty={quantity:.6f} | notional=${quantity * entry_price:.2f} "
+            f"| margin=${quantity * entry_price / leverage:.2f} | SL dist={price_risk_pct:.3%}"
+        )
         return round(quantity, 6)
 
     # ── Trade lifecycle ───────────────────────────────────────────────────────────

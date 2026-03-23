@@ -4,6 +4,7 @@ Manages SL/TP order lifecycle and trailing stop logic.
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,10 +31,12 @@ class Position:
     tp_order_id: Optional[str] = None
     peak_price: float = 0.0
     trough_price: float = 0.0
+    opened_at: float = 0.0      # unix timestamp — for race condition guard
 
     def __post_init__(self):
         self.peak_price   = self.entry_price
         self.trough_price = self.entry_price
+        self.opened_at    = time.time()
 
     @property
     def close_side(self) -> str:
@@ -171,13 +174,18 @@ class PositionManager:
             pos.update_extremes(price)
 
             # Check if position was closed on exchange (SL or TP hit)
+            # Guard: ignore for first 30s after opening (exchange propagation lag)
             ex_symbol = symbol.replace("/", "")
+            age_seconds = time.time() - pos.opened_at
             if ex_symbol not in exchange_positions:
+                if age_seconds < 30:
+                    log.debug(f"{symbol}: position not yet visible on exchange ({age_seconds:.0f}s old), waiting...")
+                    continue
                 # Position gone — calculate approximate PnL
                 pnl = self._estimate_pnl(pos, price)
                 self.risk.record_trade(pnl, symbol, pos.side)
                 closed.append(symbol)
-                log.info(f"Position closed externally: {symbol} (SL/TP hit)")
+                log.info(f"Position closed externally: {symbol} (SL/TP hit) after {age_seconds:.0f}s")
                 continue
 
             # Trailing stop update
