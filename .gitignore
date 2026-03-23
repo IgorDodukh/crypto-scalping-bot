@@ -1,0 +1,21 @@
+# API keys — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Logs and data (runtime generated)
+logs/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
