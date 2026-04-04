@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from bot.config import Config
 from bot.exchange import ExchangeClient
 from bot.indicators import ohlcv_to_df, compute_indicators, generate_signal, compute_trend_bias
+from bot.trade_store import load_trades, get_stats
 
 DATA_DIR = Path(__file__).parent / "data"
 LOG_DIR  = Path(__file__).parent / "logs"
@@ -352,7 +353,19 @@ HTML = r"""<!DOCTYPE html>
     .main-grid { grid-template-columns: 1fr; }
     .bottom-grid { grid-template-columns: 1fr; }
   }
+
+  /* Charts */
+  .charts-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;
+  }
+  .chart-canvas-wrap { padding: 16px; }
+  canvas { max-height: 200px; }
+  /* All-time stats strip */
+  .alltime-stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;
+  }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -452,6 +465,50 @@ HTML = r"""<!DOCTYPE html>
     <div class="card">
       <div class="card-header">💡 Signal Conditions</div>
       <div id="signal-detail" style="padding:14px"></div>
+    </div>
+  </div>
+
+  <!-- All-time stats -->
+  <div class="alltime-stats" style="margin-top:16px">
+    <div class="stat-card">
+      <div class="stat-label">📦 All-Time Trades</div>
+      <div class="stat-value" id="at-total">—</div>
+      <div class="stat-sub" id="at-wl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">💰 All-Time P&amp;L</div>
+      <div class="stat-value" id="at-pnl">—</div>
+      <div class="stat-sub">cumulative</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">🏆 Best Trade</div>
+      <div class="stat-value" id="at-best">—</div>
+      <div class="stat-sub" style="color:var(--green)">single trade</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">💀 Worst Trade</div>
+      <div class="stat-value" id="at-worst">—</div>
+      <div class="stat-sub" style="color:var(--red)">single trade</div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts-grid">
+    <div class="card">
+      <div class="card-header">📈 Cumulative P&amp;L</div>
+      <div class="chart-canvas-wrap"><canvas id="chart-cumulative"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-header">🎯 P&amp;L per Trade</div>
+      <div class="chart-canvas-wrap"><canvas id="chart-per-trade"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-header">📅 Daily P&amp;L</div>
+      <div class="chart-canvas-wrap"><canvas id="chart-daily"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-header">⚡ Trade Distribution</div>
+      <div class="chart-canvas-wrap"><canvas id="chart-dist"></canvas></div>
     </div>
   </div>
 
@@ -635,22 +692,202 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+// ── Charts ────────────────────────────────────────────────────────────────────
+
+const CHART_DEFAULTS = {
+  color: '#e6edf3',
+  plugins: {
+    legend: { display: false },
+    tooltip: { backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1,
+               titleColor: '#8b949e', bodyColor: '#e6edf3', padding: 10 },
+  },
+  scales: {
+    x: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#1e252e' } },
+    y: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#1e252e' } },
+  },
+};
+
+let charts = {};
+
+function destroyChart(id) {
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+}
+
+async function refreshCharts() {
+  try {
+    const res   = await fetch('/api/trades');
+    const data  = await res.json();
+    if (data.error) return;
+
+    const { trades, stats } = data;
+
+    // All-time stats strip
+    document.getElementById('at-total').textContent  = stats.total;
+    document.getElementById('at-wl').textContent     = stats.wins + 'W / ' + stats.losses + 'L · ' + fmt(stats.win_rate * 100, 1) + '%';
+    const atPnl = document.getElementById('at-pnl');
+    atPnl.textContent  = pnlStr(stats.total_pnl);
+    atPnl.className    = 'stat-value ' + pnlClass(stats.total_pnl);
+    const atBest = document.getElementById('at-best');
+    atBest.textContent = '+' + fmt(stats.best, 4) + ' USDT';
+    atBest.className   = 'stat-value pos';
+    const atWorst = document.getElementById('at-worst');
+    atWorst.textContent = fmt(stats.worst, 4) + ' USDT';
+    atWorst.className   = 'stat-value neg';
+
+    if (!trades.length) return;
+
+    // 1. Cumulative PnL
+    destroyChart('cumulative');
+    let running = 0;
+    const cumData = trades.map(t => { running += t.pnl; return parseFloat(running.toFixed(4)); });
+    charts['cumulative'] = new Chart(document.getElementById('chart-cumulative'), {
+      type: 'line',
+      data: {
+        labels: trades.map(t => '#' + t.id),
+        datasets: [{
+          data: cumData,
+          borderColor: '#388bfd',
+          backgroundColor: 'rgba(56,139,253,0.08)',
+          fill: true, tension: 0.3,
+          pointRadius: trades.length > 50 ? 0 : 3,
+          pointHoverRadius: 5, borderWidth: 2,
+        }]
+      },
+      options: { ...CHART_DEFAULTS,
+        plugins: { ...CHART_DEFAULTS.plugins, tooltip: { ...CHART_DEFAULTS.plugins.tooltip,
+          callbacks: { label: ctx => ' Cumulative: ' + (ctx.raw >= 0 ? '+' : '') + ctx.raw.toFixed(4) + ' USDT' }
+        }},
+        scales: { ...CHART_DEFAULTS.scales, y: { ...CHART_DEFAULTS.scales.y,
+          ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => (v >= 0 ? '+' : '') + v.toFixed(2) }
+        }}
+      },
+    });
+
+    // 2. PnL per trade
+    destroyChart('per-trade');
+    charts['per-trade'] = new Chart(document.getElementById('chart-per-trade'), {
+      type: 'bar',
+      data: {
+        labels: trades.map(t => '#' + t.id),
+        datasets: [{
+          data: trades.map(t => t.pnl),
+          backgroundColor: trades.map(t => t.pnl >= 0 ? 'rgba(63,185,80,0.8)' : 'rgba(248,81,73,0.8)'),
+          borderRadius: 3,
+        }]
+      },
+      options: { ...CHART_DEFAULTS,
+        plugins: { ...CHART_DEFAULTS.plugins, tooltip: { ...CHART_DEFAULTS.plugins.tooltip,
+          callbacks: {
+            label: ctx => ' PnL: ' + (ctx.raw >= 0 ? '+' : '') + ctx.raw.toFixed(4) + ' USDT',
+            title: ctx => { const t = trades[ctx[0].dataIndex]; return t.symbol + ' ' + t.side.toUpperCase() + ' · ' + t.date; }
+          }
+        }},
+        scales: { ...CHART_DEFAULTS.scales, y: { ...CHART_DEFAULTS.scales.y,
+          ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => (v >= 0 ? '+' : '') + v.toFixed(2) }
+        }}
+      },
+    });
+
+    // 3. Daily PnL
+    destroyChart('daily');
+    const dailyMap = {};
+    for (const t of trades) dailyMap[t.date] = (dailyMap[t.date] || 0) + t.pnl;
+    const dailyDates = Object.keys(dailyMap).sort();
+    const dailyVals  = dailyDates.map(d => parseFloat(dailyMap[d].toFixed(4)));
+    charts['daily'] = new Chart(document.getElementById('chart-daily'), {
+      type: 'bar',
+      data: {
+        labels: dailyDates,
+        datasets: [{
+          data: dailyVals,
+          backgroundColor: dailyVals.map(v => v >= 0 ? 'rgba(63,185,80,0.8)' : 'rgba(248,81,73,0.8)'),
+          borderRadius: 4,
+        }]
+      },
+      options: { ...CHART_DEFAULTS,
+        plugins: { ...CHART_DEFAULTS.plugins, tooltip: { ...CHART_DEFAULTS.plugins.tooltip,
+          callbacks: { label: ctx => ' Daily PnL: ' + (ctx.raw >= 0 ? '+' : '') + ctx.raw.toFixed(4) + ' USDT' }
+        }},
+        scales: { ...CHART_DEFAULTS.scales, y: { ...CHART_DEFAULTS.scales.y,
+          ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => (v >= 0 ? '+' : '') + v.toFixed(2) }
+        }}
+      },
+    });
+
+    // 4. Trade distribution
+    destroyChart('dist');
+    const pnls = trades.map(t => t.pnl);
+    const step = 0.5;
+    const mn = Math.floor(Math.min(...pnls) / step) * step;
+    const mx = Math.ceil(Math.max(...pnls) / step) * step;
+    const bucketLabels = [], buckets = [];
+    for (let b = mn; b <= mx; b = parseFloat((b + step).toFixed(6))) {
+      bucketLabels.push((b >= 0 ? '+' : '') + b.toFixed(1));
+      buckets.push(pnls.filter(p => p >= b && p < b + step).length);
+    }
+    charts['dist'] = new Chart(document.getElementById('chart-dist'), {
+      type: 'bar',
+      data: {
+        labels: bucketLabels,
+        datasets: [{
+          data: buckets,
+          backgroundColor: bucketLabels.map(l => parseFloat(l) >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'),
+          borderRadius: 3,
+        }]
+      },
+      options: { ...CHART_DEFAULTS,
+        plugins: { ...CHART_DEFAULTS.plugins, tooltip: { ...CHART_DEFAULTS.plugins.tooltip,
+          callbacks: { label: ctx => ' Count: ' + ctx.raw + ' trades' }
+        }},
+        scales: { ...CHART_DEFAULTS.scales, y: { ...CHART_DEFAULTS.scales.y,
+          ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => v }
+        }}
+      },
+    });
+
+  } catch(e) {
+    console.error('Chart refresh error:', e);
+  }
+}
+
 // Countdown timer
+let chartRefreshCounter = 0;
 setInterval(() => {
   countdown--;
   if (countdown <= 0) {
     countdown = 6;
+    chartRefreshCounter++;
     refresh();
+    if (chartRefreshCounter % 5 === 0) refreshCharts();
   }
   document.getElementById('countdown').textContent = `Next refresh in ${countdown}s`;
 }, 1000);
 
 // Initial load
 refresh();
+refreshCharts();
 </script>
 </body>
 </html>
 """
+
+
+async def api_trades(request):
+    """Return all historical trades + aggregate stats."""
+    try:
+        trades = load_trades()
+        stats  = get_stats()
+        return web.Response(
+            text=json.dumps({"trades": trades, "stats": stats}),
+            content_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        return web.Response(
+            text=json.dumps({"error": str(e)}),
+            content_type="application/json",
+            status=500,
+        )
 
 
 async def root(request):
@@ -661,6 +898,7 @@ async def make_app():
     app = web.Application()
     app.router.add_get("/",           root)
     app.router.add_get("/api/status", api_status)
+    app.router.add_get("/api/trades", api_trades)
     return app
 
 

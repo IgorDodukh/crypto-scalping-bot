@@ -217,7 +217,16 @@ class PositionManager:
                     continue
                 # Position gone — calculate approximate PnL
                 pnl = self._estimate_pnl(pos, price)
-                self.risk.record_trade(pnl, symbol, pos.side)
+                self.risk.record_trade(
+                    pnl=pnl,
+                    symbol=symbol,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    exit_price=price,
+                    quantity=pos.quantity,
+                    reason=pos.reason,
+                    opened_at=pos.opened_at,
+                )
                 closed.append(symbol)
                 log.info(f"Position closed externally: {symbol} (SL/TP hit) after {age_seconds:.0f}s")
                 continue

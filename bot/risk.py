@@ -10,6 +10,7 @@ from typing import Optional
 
 from .config import Config
 from .logger import get_logger
+from . import trade_store
 
 log = get_logger("risk", Config.LOG_LEVEL)
 
@@ -183,7 +184,10 @@ class RiskManager:
 
     # ── Trade lifecycle ───────────────────────────────────────────────────────────
 
-    def record_trade(self, pnl: float, symbol: str, side: str):
+    def record_trade(self, pnl: float, symbol: str, side: str,
+                     entry_price: float = 0.0, exit_price: float = 0.0,
+                     quantity: float = 0.0, reason: str = "",
+                     opened_at: float = None):
         """Call this after every closed trade."""
         self.daily_pnl   += pnl
         self.trade_count += 1
@@ -198,6 +202,15 @@ class RiskManager:
             f"Daily PnL={self.daily_pnl:+.4f} | W/L={self.wins}/{self.losses}"
         )
         self._save_journal()
+        try:
+            trade_store.append_trade(
+                symbol=symbol, side=side,
+                entry_price=entry_price, exit_price=exit_price,
+                quantity=quantity, pnl=pnl,
+                reason=reason, opened_at=opened_at,
+            )
+        except Exception as e:
+            log.warning(f"Could not persist trade to trade store: {e}")
 
     # ── Stats ─────────────────────────────────────────────────────────────────────
 
