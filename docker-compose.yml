@@ -7,7 +7,7 @@ services:
     restart: unless-stopped          # auto-restarts on crash or server reboot
 
     ports:
-      - "8765:8765"                  # dashboard → open http://localhost:8765
+      - "8766:8765"                  # dashboard → open http://localhost:8766
 
     environment:
       # ── Paste your Binance Testnet keys here ──────────────────────────────

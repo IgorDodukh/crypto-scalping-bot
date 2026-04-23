@@ -20,6 +20,8 @@ from .logger import get_logger
 log     = get_logger("engine", Config.LOG_LEVEL)
 console = Console()
 
+CALL_TIMEOUT = 30   # seconds — hard timeout for any single exchange call
+
 
 class TradingEngine:
     def __init__(self):
@@ -28,6 +30,7 @@ class TradingEngine:
         self.positions = PositionManager(self.exchange, self.risk)
         self._running  = False
         self._tick     = 0
+        self._consecutive_errors = 0   # tracks repeated tick failures
 
     # ── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -106,8 +109,26 @@ class TradingEngine:
             self._tick += 1
             try:
                 await self._tick_all_pairs()
+                self._consecutive_errors = 0   # reset on success
             except Exception as e:
-                log.error(f"Tick error: {e}", exc_info=True)
+                self._consecutive_errors += 1
+                log.error(f"Tick error (#{self._consecutive_errors}): {e}", exc_info=True)
+
+                # After 5 consecutive failures, assume connection is dead and reconnect
+                if self._consecutive_errors >= 5:
+                    log.warning(
+                        "5 consecutive tick errors — reconnecting to exchange..."
+                    )
+                    try:
+                        await self.exchange.close()
+                    except Exception:
+                        pass
+                    self.exchange = ExchangeClient()
+                    await self.exchange.connect()
+                    # Re-wire position manager to new exchange client
+                    self.positions.exchange = self.exchange
+                    self._consecutive_errors = 0
+                    log.info("Exchange reconnected successfully.")
 
             if self._tick % 10 == 0:
                 self._print_status()
@@ -118,7 +139,10 @@ class TradingEngine:
 
     async def _tick_all_pairs(self):
         """Run one evaluation cycle for all configured pairs concurrently."""
-        balance = await self.exchange.get_usdt_balance()
+        balance = await asyncio.wait_for(
+            self.exchange.get_usdt_balance(),
+            timeout=CALL_TIMEOUT,
+        )
         log.debug(f"Balance: {balance:.2f} USDT | Open positions: {self.positions.open_count}")
 
         # Risk check before doing anything
@@ -143,9 +167,12 @@ class TradingEngine:
         try:
             # Fetch candles for both timeframes concurrently
             # 500 bars needed for EMA200 + MACD warm-up
-            ohlcv_1m, ohlcv_5m = await asyncio.gather(
-                self.exchange.fetch_ohlcv(symbol, Config.ENTRY_TF, limit=500),
-                self.exchange.fetch_ohlcv(symbol, Config.TREND_TF, limit=200),
+            ohlcv_1m, ohlcv_5m = await asyncio.wait_for(
+                asyncio.gather(
+                    self.exchange.fetch_ohlcv(symbol, Config.ENTRY_TF, limit=500),
+                    self.exchange.fetch_ohlcv(symbol, Config.TREND_TF, limit=200),
+                ),
+                timeout=CALL_TIMEOUT,
             )
 
             df_1m = compute_indicators(ohlcv_to_df(ohlcv_1m))
@@ -191,7 +218,10 @@ class TradingEngine:
         prices = {}
         for symbol in Config.PAIRS:
             try:
-                ticker = await self.exchange.fetch_ticker(symbol)
+                ticker = await asyncio.wait_for(
+                    self.exchange.fetch_ticker(symbol),
+                    timeout=CALL_TIMEOUT,
+                )
                 prices[symbol] = float(ticker["last"])
             except Exception:
                 pass

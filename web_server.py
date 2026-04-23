@@ -30,12 +30,32 @@ PORT     = 8765
 _exchange: ExchangeClient | None = None
 _start_time = datetime.now(timezone.utc)
 
+EXCHANGE_TIMEOUT = 20  # seconds — max wait for any single exchange call
+
 
 async def get_exchange() -> ExchangeClient:
+    """Return a connected ExchangeClient, reconnecting if the connection is stale."""
     global _exchange
     if _exchange is None:
         _exchange = ExchangeClient()
         await _exchange.connect()
+        return _exchange
+
+    # Lightweight ping to detect a stale connection (e.g. after overnight idle)
+    try:
+        await asyncio.wait_for(
+            _exchange.exchange.fetch_time(),
+            timeout=10,
+        )
+    except Exception:
+        # Ping failed — close old connection and reconnect
+        try:
+            await _exchange.close()
+        except Exception:
+            pass
+        _exchange = ExchangeClient()
+        await _exchange.connect()
+
     return _exchange
 
 
@@ -80,18 +100,29 @@ def get_uptime() -> str:
 
 # ── API endpoint ──────────────────────────────────────────────────────────────
 
+async def _fetch_status_data():
+    """Inner coroutine — wrapped with a timeout in api_status."""
+    ex      = await get_exchange()
+    balance = await ex.get_usdt_balance()
+    raw_pos = await ex.fetch_open_positions()
+    return ex, balance, raw_pos
+
+
 async def api_status(request):
     try:
-        ex      = await get_exchange()
-        balance = await ex.get_usdt_balance()
-        raw_pos = await ex.fetch_open_positions()
+        ex, balance, raw_pos = await asyncio.wait_for(
+            _fetch_status_data(), timeout=EXCHANGE_TIMEOUT
+        )
 
         market_data = []
         for symbol in Config.PAIRS:
             try:
-                ohlcv_1m, ohlcv_5m = await asyncio.gather(
-                    ex.fetch_ohlcv(symbol, "1m", limit=500),
-                    ex.fetch_ohlcv(symbol, "5m", limit=200),
+                ohlcv_1m, ohlcv_5m = await asyncio.wait_for(
+                    asyncio.gather(
+                        ex.fetch_ohlcv(symbol, "1m", limit=500),
+                        ex.fetch_ohlcv(symbol, "5m", limit=200),
+                    ),
+                    timeout=EXCHANGE_TIMEOUT,
                 )
                 df_1m  = compute_indicators(ohlcv_to_df(ohlcv_1m))
                 df_5m  = compute_indicators(ohlcv_to_df(ohlcv_5m))
@@ -330,6 +361,57 @@ HTML = r"""<!DOCTYPE html>
     padding: 32px; text-align: center; color: var(--muted); font-size: 12px;
   }
 
+  /* Close button */
+  .btn-close-pos {
+    background: transparent; color: var(--red);
+    border: 1px solid var(--red); border-radius: 5px;
+    padding: 3px 10px; font-size: 11px; font-weight: 700;
+    cursor: pointer; letter-spacing: 0.3px;
+    transition: background 0.15s, color 0.15s;
+  }
+  .btn-close-pos:hover {
+    background: var(--red); color: #fff;
+  }
+  .btn-close-pos:disabled {
+    opacity: 0.4; cursor: not-allowed;
+  }
+
+  /* Confirmation modal */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.65); backdrop-filter: blur(3px);
+    z-index: 1000; align-items: center; justify-content: center;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px 32px; min-width: 360px; max-width: 440px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  .modal-title {
+    font-size: 16px; font-weight: 700; margin-bottom: 10px; color: var(--text);
+  }
+  .modal-body {
+    color: var(--muted); font-size: 13px; line-height: 1.6; margin-bottom: 22px;
+  }
+  .modal-body strong { color: var(--text); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .btn-cancel {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 18px; font-size: 13px; cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .btn-cancel:hover { border-color: var(--text); color: var(--text); }
+  .btn-confirm-close {
+    background: var(--red); color: #fff;
+    border: none; border-radius: 6px;
+    padding: 7px 18px; font-size: 13px; font-weight: 700; cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn-confirm-close:hover { opacity: 0.85; }
+  .btn-confirm-close:disabled { opacity: 0.5; cursor: not-allowed; }
+
   /* Bottom grid */
   .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 
@@ -514,6 +596,18 @@ HTML = r"""<!DOCTYPE html>
 
 </div>
 
+<!-- Close-position confirmation modal -->
+<div class="modal-overlay" id="close-modal">
+  <div class="modal-box">
+    <div class="modal-title">⚠️ Close Position</div>
+    <div class="modal-body" id="modal-body">Loading…</div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="modal-cancel">Cancel</button>
+      <button class="btn-confirm-close" id="modal-confirm">Close Position</button>
+    </div>
+  </div>
+</div>
+
 <!-- Refresh bar -->
 <div class="refresh-bar">
   <div class="spinner" id="spinner"></div>
@@ -643,6 +737,7 @@ async function refresh() {
             <th class="right">Size</th>
             <th class="right">Liq. Price</th>
             <th class="right">Unr. P&L</th>
+            <th class="center">Action</th>
           </tr></thead>
           <tbody>
             ${data.positions.map(p => `
@@ -653,6 +748,11 @@ async function refresh() {
                 <td class="right">${p.size}</td>
                 <td class="right">${fmtPrice(p.liq_price)}</td>
                 <td class="right"><span class="${pnlClass(p.unr_pnl)}">${pnlStr(p.unr_pnl)}</span></td>
+                <td class="center">
+                  <button class="btn-close-pos"
+                    onclick="confirmClose('${p.symbol}','${p.side}',${p.size},'${pnlStr(p.unr_pnl)}')"
+                  >Close</button>
+                </td>
               </tr>
             `).join('')}
           </tbody>
@@ -691,6 +791,62 @@ async function refresh() {
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+// ── Manual position close ────────────────────────────────────────────────────
+
+let _pendingClose = null;
+
+function confirmClose(symbol, side, size, pnlLabel) {
+  _pendingClose = { symbol, side, size };
+  const sideLabel = side === 'long' ? '▲ LONG' : '▼ SHORT';
+  const pnlColor  = parseFloat(pnlLabel) >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('modal-body').innerHTML = `
+    Are you sure you want to <strong>market-close</strong> this position?<br><br>
+    <strong>Symbol:</strong> ${symbol}<br>
+    <strong>Side:</strong> ${sideLabel}<br>
+    <strong>Size:</strong> ${size} contracts<br>
+    <strong>Unrealised P&amp;L:</strong> <span style="color:${pnlColor};font-weight:700">${pnlLabel}</span><br><br>
+    This will place an immediate <strong>market order</strong> and cancel all open orders for ${symbol}.
+  `;
+  document.getElementById('close-modal').classList.add('active');
+}
+
+function dismissModal() {
+  document.getElementById('close-modal').classList.remove('active');
+  _pendingClose = null;
+}
+
+async function execClose() {
+  if (!_pendingClose) return;
+  const btn = document.getElementById('modal-confirm');
+  btn.disabled = true;
+  btn.textContent = 'Closing…';
+  try {
+    const res = await fetch('/api/close_position', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_pendingClose),
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert('Error: ' + data.error);
+    } else {
+      dismissModal();
+      refresh();  // immediately re-fetch positions
+    }
+  } catch(e) {
+    alert('Network error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Close Position';
+  }
+}
+
+document.getElementById('modal-cancel').addEventListener('click', dismissModal);
+document.getElementById('modal-confirm').addEventListener('click', execClose);
+document.getElementById('close-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('close-modal')) dismissModal();
+});
 
 // ── Charts ────────────────────────────────────────────────────────────────────
 
@@ -894,11 +1050,39 @@ async def root(request):
     return web.Response(text=HTML, content_type="text/html")
 
 
+async def api_close_position(request):
+    """POST /api/close_position — manually close an open position at market."""
+    try:
+        body     = await request.json()
+        symbol   = body["symbol"]
+        side     = body["side"]          # 'long' | 'short'
+        quantity = float(body["size"])
+
+        ex = await get_exchange()
+        # Cancel any outstanding SL / TP orders first
+        await ex.cancel_all_orders(symbol)
+        # Close the position with an opposite market order
+        await ex.close_position(symbol, side, quantity)
+
+        return web.Response(
+            text=json.dumps({"ok": True, "symbol": symbol}),
+            content_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        return web.Response(
+            text=json.dumps({"error": str(e)}),
+            content_type="application/json",
+            status=500,
+        )
+
+
 async def make_app():
     app = web.Application()
-    app.router.add_get("/",           root)
-    app.router.add_get("/api/status", api_status)
-    app.router.add_get("/api/trades", api_trades)
+    app.router.add_get("/",                  root)
+    app.router.add_get("/api/status",        api_status)
+    app.router.add_get("/api/trades",        api_trades)
+    app.router.add_post("/api/close_position", api_close_position)
     return app
 
 

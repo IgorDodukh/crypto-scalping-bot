@@ -35,6 +35,27 @@ class RiskManager:
         self.losses: int = 0
         self._load_journal()
 
+    # ── Day rollover ─────────────────────────────────────────────────────────────
+
+    def _check_day_rollover(self):
+        """
+        Detect UTC midnight rollover and reset all daily stats.
+        Call this at the start of any method that uses daily counters.
+        """
+        today = date.today().isoformat()
+        if today != self.today:
+            log.info(
+                f"📅 Day rollover detected: {self.today} → {today}. Resetting daily stats."
+            )
+            self.today        = today
+            self.journal_path = DATA_DIR / f"journal_{today}.json"
+            self.daily_pnl    = 0.0
+            self.trade_count  = 0
+            self.wins         = 0
+            self.losses       = 0
+            # Persist an empty journal for the new day
+            self._save_journal()
+
     # ── Persistence ──────────────────────────────────────────────────────────────
 
     def _load_journal(self):
@@ -76,6 +97,7 @@ class RiskManager:
         Returns (allowed: bool, reason: str).
         Must pass before ANY new trade is opened.
         """
+        self._check_day_rollover()
         # Daily drawdown guard
         if self.initial_balance > 0:
             daily_loss_pct = -self.daily_pnl / self.initial_balance
@@ -189,6 +211,7 @@ class RiskManager:
                      quantity: float = 0.0, reason: str = "",
                      opened_at: float = None):
         """Call this after every closed trade."""
+        self._check_day_rollover()
         self.daily_pnl   += pnl
         self.trade_count += 1
         if pnl >= 0:
