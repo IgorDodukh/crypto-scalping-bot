@@ -4,6 +4,8 @@ Orchestrates: data fetch → indicators → signal → risk check → order exec
 """
 
 import asyncio
+
+import ccxt
 from datetime import datetime
 
 from rich.console import Console
@@ -110,6 +112,11 @@ class TradingEngine:
             try:
                 await self._tick_all_pairs()
                 self._consecutive_errors = 0   # reset on success
+            except ccxt.InvalidNonce as e:
+                log.warning(
+                    f"Clock drift detected (InvalidNonce) — resyncing time and retrying. [{e}]"
+                )
+                await self.exchange.resync_time()
             except Exception as e:
                 self._consecutive_errors += 1
                 log.error(f"Tick error (#{self._consecutive_errors}): {e}", exc_info=True)

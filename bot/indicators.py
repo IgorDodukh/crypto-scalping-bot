@@ -198,15 +198,19 @@ def generate_signal(df_1m: pd.DataFrame, df_5m: pd.DataFrame) -> SignalResult:
     cross_up   = bool(df_1m["ema_cross_up"].iloc[-3:].any())
     cross_down = bool(df_1m["ema_cross_down"].iloc[-3:].any())
 
-    sl_dist = atr * c.ATR_SL_MULT
-    tp_dist = atr * c.ATR_TP_MULT
+    # Grade-specific helpers: SL/TP distances are looked up from Config
+    # per grade (A/B/C) so risk-reward can be tuned independently.
 
     def long_result(reason, grade):
+        sl_dist = atr * getattr(c, f"ATR_SL_MULT_{grade}")
+        tp_dist = atr * getattr(c, f"ATR_TP_MULT_{grade}")
         entry = price
         return SignalResult("long", entry, round(entry - sl_dist, 6),
                             round(entry + tp_dist, 6), atr, reason, grade)
 
     def short_result(reason, grade):
+        sl_dist = atr * getattr(c, f"ATR_SL_MULT_{grade}")
+        tp_dist = atr * getattr(c, f"ATR_TP_MULT_{grade}")
         entry = price
         return SignalResult("short", entry, round(entry + sl_dist, 6),
                             round(entry - tp_dist, 6), atr, reason, grade)

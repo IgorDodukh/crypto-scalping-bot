@@ -50,19 +50,21 @@ class Position:
 
     def trailing_stop(self, current_price: float) -> Optional[float]:
         """
-        Activates a trailing stop once price moves 1 ATR in our favour.
-        Trails at 1× ATR behind the peak (long) or trough (short).
+        Activates a trailing stop once price moves BREAKEVEN_ATR_TRIGGER × ATR
+        in our favour. Trails at TRAILING_ATR_DIST × ATR behind the peak (long)
+        or trough (short). Both values are set in .env / Config.
         Returns new SL price if it should be updated, else None.
         """
-        trail_dist = self.atr * 1.0   # trail at 1× ATR
+        trail_dist = self.atr * Config.TRAILING_ATR_DIST
+        trigger    = self.atr * Config.BREAKEVEN_ATR_TRIGGER
 
         if self.side == "long":
-            if self.peak_price > self.entry_price + self.atr:
+            if self.peak_price > self.entry_price + trigger:
                 new_sl = round(self.peak_price - trail_dist, 6)
                 if new_sl > self.stop_loss:
                     return new_sl
         else:
-            if self.trough_price < self.entry_price - self.atr:
+            if self.trough_price < self.entry_price - trigger:
                 new_sl = round(self.trough_price + trail_dist, 6)
                 if new_sl < self.stop_loss:
                     return new_sl
@@ -288,21 +290,39 @@ class PositionManager:
     # ── Helpers ───────────────────────────────────────────────────────────────────
 
     def _estimate_pnl(self, pos: Position, exit_price: float) -> float:
-        """Rough PnL estimate for journal (exchange fees not deducted here)."""
+        """Rough PnL estimate for journal including estimated exchange fees."""
+        # Binance Futures default taker fee is 0.04%
+        FEE_RATE = 0.0004
+        entry_notional = pos.entry_price * pos.quantity
+        exit_notional = exit_price * pos.quantity
+        estimated_fees = (entry_notional + exit_notional) * FEE_RATE
+
         if pos.side == "long":
-            return (exit_price - pos.entry_price) * pos.quantity * Config.LEVERAGE
+            gross_pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
-            return (pos.entry_price - exit_price) * pos.quantity * Config.LEVERAGE
+            gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+            
+        return gross_pnl - estimated_fees
 
     def status_table(self, current_prices: dict = None) -> list[dict]:
-        """Returns a list of dicts for pretty-printing, with live unrealised P&L."""
+        """Returns a list of dicts for pretty-printing, with live net unrealised P&L."""
+        # Binance Futures default taker fee is 0.04%
+        FEE_RATE = 0.0004
         rows = []
         for sym, pos in self.positions.items():
             price = (current_prices or {}).get(sym, pos.entry_price)
+            
+            entry_notional = pos.entry_price * pos.quantity
+            current_notional = price * pos.quantity
+            estimated_fees = (entry_notional + current_notional) * FEE_RATE
+            
             if pos.side == "long":
-                unr_pnl = (price - pos.entry_price) * pos.quantity * Config.LEVERAGE
+                gross_pnl = (price - pos.entry_price) * pos.quantity
             else:
-                unr_pnl = (pos.entry_price - price) * pos.quantity * Config.LEVERAGE
+                gross_pnl = (pos.entry_price - price) * pos.quantity
+                
+            unr_pnl = gross_pnl - estimated_fees
+            
             rows.append({
                 "Symbol": sym,
                 "Side":   pos.side.upper(),

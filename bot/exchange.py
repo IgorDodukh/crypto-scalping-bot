@@ -25,7 +25,7 @@ class ExchangeClient:
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
-                # Skip spot/margin currency fetch — testnet keys are futures-only
+                "recvWindow": 10000,
                 "fetchCurrencies": False,
             },
         }
@@ -50,9 +50,25 @@ class ExchangeClient:
 
     async def connect(self):
         await self.exchange.load_markets()
+        # Sync clock offset with Binance server time on every (re)connect
+        await self.resync_time()
         self._markets_loaded = True
         mode = "TESTNET" if Config.TESTNET else "LIVE"
         log.info(f"Connected to Binance Futures [{mode}]")
+
+    async def resync_time(self) -> None:
+        """Re-query Binance server time and recalculate the local clock offset.
+
+        Call this whenever an InvalidNonce (-1021) error is caught to
+        immediately re-align the clock without requiring a full reconnect.
+        """
+        try:
+            await self.exchange.load_time_difference()
+            log.debug(
+                f"Clock re-synced. offset={self.exchange.options.get('timeDifference', 0)} ms"
+            )
+        except Exception as e:
+            log.warning(f"Time resync failed: {e}")
 
     async def close(self):
         await self.exchange.close()

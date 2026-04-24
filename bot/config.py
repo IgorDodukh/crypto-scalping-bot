@@ -3,6 +3,7 @@ config.py - Central configuration loader
 All runtime settings flow from .env or environment variables.
 """
 
+from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
@@ -44,8 +45,22 @@ class Config:
 
     # ATR (for dynamic SL/TP)
     ATR_PERIOD: int = 14
-    ATR_SL_MULT: float = 1.5   # Stop-loss = 1.5× ATR
-    ATR_TP_MULT: float = 2.5   # Take-profit = 2.5× ATR  (1:1.67 R:R)
+    
+    # Grade A: High Confluence
+    ATR_SL_MULT_A: float = float(os.getenv("ATR_SL_MULT_A", 1.5))
+    ATR_TP_MULT_A: float = float(os.getenv("ATR_TP_MULT_A", 3.5))  # Higher target for A-grade
+    
+    # Grade B: RSI Reversal (Current default)
+    ATR_SL_MULT_B: float = float(os.getenv("ATR_SL_MULT_B", 1.5))
+    ATR_TP_MULT_B: float = float(os.getenv("ATR_TP_MULT_B", 2.5))
+    
+    # Grade C: Momentum Continuation
+    ATR_SL_MULT_C: float = float(os.getenv("ATR_SL_MULT_C", 1.5))
+    ATR_TP_MULT_C: float = float(os.getenv("ATR_TP_MULT_C", 2.0))  # Lower target for chasing
+    
+    # Trailing Stop / Break-even
+    BREAKEVEN_ATR_TRIGGER: float = float(os.getenv("BREAKEVEN_ATR_TRIGGER", 1.0))
+    TRAILING_ATR_DIST: float     = float(os.getenv("TRAILING_ATR_DIST", 1.0))
 
     # Volume: candle volume must be > N× 20-bar average
     VOLUME_THRESHOLD: float = 1.3
